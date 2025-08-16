@@ -1,0 +1,416 @@
+# Бот для сравнения 2 магистратур ИТМО (AI и AI Product), с парсингом учебных планов
+# Зависимости: aiogram aiohttp beautifulsoup4 rapidfuzz pdfminer.six nest_asyncio
+
+import os
+import re
+import io
+import json
+import asyncio
+import nest_asyncio
+from datetime import datetime
+from typing import Dict, List, Tuple, Optional
+
+import aiohttp
+from bs4 import BeautifulSoup
+from rapidfuzz import fuzz, process
+from pdfminer.high_level import extract_text as pdf_extract_text
+
+from aiogram import Bot, Dispatcher
+from aiogram.types import Message
+from aiogram.filters import Command
+from aiogram.fsm.storage.memory import MemoryStorage
+
+
+nest_asyncio.apply()
+
+# 🔑 ВСТАВЬ токен бота тут
+API_TOKEN = ("7653281120:AAE-pU2-GrC1ZQ8UW3S8XUySjSegxfoU1W8")
+
+bot = Bot(token=API_TOKEN)
+dp = Dispatcher(storage=MemoryStorage())
+
+# Конфигурация программ
+PROGRAMS = {
+    "ai": {
+        "title": "Искусственный интеллект (AI Talent Hub)",
+        "landing": "https://ai.itmo.ru/",
+        # запасной id файла на Google Drive (если на лендинге не нашли ссылку)
+        "fallback_drive_id": "1NSuBA0VkPzqNfdOD2IDR4TSDY2ea66nx",
+    },
+    "aiproduct": {
+        "title": "AI Product (Управление ИИ-продуктами)",
+        "landing": "https://aiproduct.itmo.ru/",
+        "fallback_drive_id": "1Uod9BdkrFqSfiCq6w2nLHQC-tPW_NNRJ",
+    },
+}
+
+CACHE_PATH = "plans_cache.json"
+
+# Ключевые слова для тегов дисциплин (используются в рекомендациях)
+TOPIC_KEYWORDS = {
+    "NLP": ["nlp", "язык", "language", "текст", "bert", "gpt", "llm"],
+    "CV": ["зрение", "изображ", "vision", "cv", "video", "видео"],
+    "MLOps": ["mlops", "devops", "docker", "kubernetes", "cicd", "ci/cd"],
+    "RecSys": ["рекоменд", "recsys", "персонализац"],
+    "Graphs": ["граф", "graph", "gnn"],
+    "RL": ["подкреплен", "reinforcement", "rl"],
+    "GenAI": ["генератив", "gpt", "diffusion", "stable", "lora", "prompt"],
+    "DataEng": ["данн", "etl", "pipeline", "spark", "hadoop", "kafka"],
+    "DS/ML": ["машин", "machine", "обучен", "ml", "классификац", "регресс", "кластер"],
+    "Statistics": ["статист", "вероятн", "hypothesis", "а/b", "a/b", "тест"],
+    "Product": ["продукт", "product", "custdev", "hypothes", "рынок", "go-to-market", "pm"],
+    "BA/BI": ["bi", "метрик", "аналит", "sql", "dashboard"],
+}
+
+# Утилиты скачивания/парсинга
+DRIVE_REGEX = re.compile(r"https?://drive\.google\.com/file/d/([A-Za-z0-9_\-]+)/view")
+
+def drive_download_url(file_id: str) -> str:
+    return f"https://drive.google.com/uc?export=download&id={file_id}"
+
+async def fetch_text(session: aiohttp.ClientSession, url: str) -> str:
+    async with session.get(url, timeout=40) as r:
+        r.raise_for_status()
+        return await r.text()
+
+async def fetch_bytes(session: aiohttp.ClientSession, url: str) -> bytes:
+    async with session.get(url, timeout=120) as r:
+        r.raise_for_status()
+        return await r.read()
+
+def extract_drive_id_from_html(html: str) -> Optional[str]:
+    m = DRIVE_REGEX.search(html)
+    return m.group(1) if m else None
+
+def normalize_text(s: str) -> str:
+    return re.sub(r"\s+", " ", s).strip()
+
+def looks_like_course(line: str) -> bool:
+    """Эвристика для выделения строк с названиями дисциплин из текста PDF."""
+    l = line.strip()
+    if len(l) < 4 or len(l) > 140:
+        return False
+
+    # отсекаем служебные строки/метаданные
+    bad_fragments = [
+        "учебный план", "семестр", "год", "итого", "факультатив",
+        "вкр", "практик", "практика", "зачет", "экзамен",
+        "з.е.", "кредит", "форма контроля", "календар", "план-график",
+        "университет итмо", "направлен", "квалификац", "образовательн",
+        "модуль", "трудоемк", "самостоятель", "час", "часов", "сессия",
+        "дисциплины по выбору", "выборные дисциплины",
+    ]
+    low = l.lower()
+    if any(key in low for key in bad_fragments):
+        return False
+
+    # как минимум 2 слова и есть буквы
+    if not re.search(r"[A-Za-zА-Яа-яЁё]", l):
+        return False
+    if len(l.split()) < 2:
+        return False
+        # заголовки капсом не считаем
+    if l == l.upper() and re.search(r"[А-ЯA-Z]", l):
+        return False
+
+    # одиночные аббревиатуры отсекаем (кроме ML/NLP/CV)
+    if len(l.split()) == 1 and len(l) <= 6 and l.isupper():
+        return l in {"ML", "NLP", "CV"}
+
+    return True
+
+def parse_courses_from_pdf_bytes(pdf_bytes: bytes) -> Tuple[List[str], str]:
+    """Возвращает (список дисциплин, сырой текст). Парсинг через pdfminer.six"""
+    with io.BytesIO(pdf_bytes) as bio:
+        raw_text = pdf_extract_text(bio) or ""
+
+    courses: List[str] = []
+    for raw_line in raw_text.splitlines():
+        line = normalize_text(raw_line)
+        if looks_like_course(line):
+            courses.append(line)
+
+    # удаляем дубли, сохраняем порядок
+    seen = set()
+    deduped = []
+    for c in courses:
+        key = c.lower()
+        if key not in seen:
+            seen.add(key)
+            deduped.append(c)
+
+    deduped = [re.sub(r"\s*[\.\:;,—-]\s*$", "", c).strip() for c in deduped]
+    return deduped, raw_text
+
+async def fetch_program_plan(session: aiohttp.ClientSession, key: str, meta: Dict) -> Dict:
+    """Скачивает PDF «Учебный план» через ссылку с лендинга и парсит его."""
+    landing_url = meta["landing"]
+    fallback_id = meta["fallback_drive_id"]
+
+    try:
+        html = await fetch_text(session, landing_url)
+        
+        drive_id = extract_drive_id_from_html(html) or fallback_id
+    except Exception:
+        drive_id = fallback_id
+
+    pdf_url = drive_download_url(drive_id)
+    pdf_bytes = await fetch_bytes(session, pdf_url)
+    courses, raw_text = parse_courses_from_pdf_bytes(pdf_bytes)
+
+    return {
+        "key": key,
+        "title": meta["title"],
+        "landing": landing_url,
+        "drive_id": drive_id,
+        "pdf_url": pdf_url,
+        "courses": courses,
+        "raw_text": raw_text,
+        "updated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+    }
+
+async def sync_all() -> Dict[str, Dict]:
+    async with aiohttp.ClientSession(headers={"User-Agent": "ITMO-PlanBot/1.0"}) as session:
+        results = {}
+        for key, meta in PROGRAMS.items():
+            results[key] = await fetch_program_plan(session, key, meta)
+
+        with open(CACHE_PATH, "w", encoding="utf-8") as f:
+            json.dump(results, f, ensure_ascii=False, indent=2)
+        return results
+
+def load_cache() -> Dict[str, Dict]:
+    if os.path.exists(CACHE_PATH):
+        with open(CACHE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+PLANS: Dict[str, Dict] = load_cache()
+
+# Логика ответов
+def ensure_data_loaded() -> bool:
+    return bool(PLANS) and all(k in PLANS for k in PROGRAMS.keys())
+
+def tag_course(course: str) -> List[str]:
+    low = course.lower()
+    tags = []
+    for tag, keys in TOPIC_KEYWORDS.items():
+        if any(k in low for k in keys):
+            tags.append(tag)
+    return tags or ["DS/ML"]
+
+def find_program_key(text: str) -> Optional[str]:
+    t = text.lower()
+    if "product" in t or "продукт" in t or "управлен" in t:
+        return "aiproduct"
+    if "ai" in t or "искусствен" in t:
+        return "ai"
+    return None
+
+def answer_is_relevant(user_q: str) -> bool:
+    topics = [
+        "магистр", "магистратур", "дисциплин", "курс", "электив",
+        "план", "учебн", "семестр", "экзамен", "вступительн",
+        "стоимост", "общежит", "онлайн", "очная", "вкр", "трек",
+        "роль", "менеджер", "ml", "ai", "data", "product", "продакт",
+    ]
+    low = user_q.lower()
+    return any(k in low for k in topics)
+
+def rag_answer(user_q: str, program_keys: List[str]) -> str:
+    corpus = []
+    for k in program_keys:
+        block = PLANS.get(k, {})
+        txt = block.get("raw_text", "")
+        if txt:
+            corpus.append((k, block["title"], txt))
+
+    if not corpus:
+        return "Пока нет данных. Используйте /sync, чтобы загрузить учебные планы."
+
+    # разрезаем текст на абзацы и ранжируем
+    chunks = []
+    for k, title, txt in corpus:
+      for para in re.split(r"\n{2,}", txt):
+            chunk = normalize_text(para)
+            if len(chunk) > 50:
+                chunks.append((k, title, chunk))
+
+    choices = [c[2] for c in chunks]
+    top = process.extract(user_q, choices, scorer=fuzz.token_set_ratio, limit=3)
+    hits = []
+    for (cand, score, idx) in top:
+        k, title, chunk = chunks[idx]
+        hits.append(f"— [{title}] {chunk[:450]}{'...' if len(chunk)>450 else ''} (релевантность {score}%)")
+
+    return "Нашёл релевантные фрагменты:\n\n" + "\n\n".join(hits)
+
+def recommend_electives(background_note: str, program_key: str) -> List[str]:
+    prog = PLANS.get(program_key, {})
+    courses = prog.get("courses", [])
+    if not courses:
+        return []
+
+    low = background_note.lower()
+    desired_tags = set()
+    for tag, keys in TOPIC_KEYWORDS.items():
+        if any(k in low for k in keys):
+            desired_tags.add(tag)
+
+    if not desired_tags:
+        desired_tags = {"DS/ML", "GenAI", "NLP", "CV", "MLOps", "DataEng", "Product", "Statistics"}
+
+    scored = []
+    for c in courses:
+        c_tags = set(tag_course(c))
+        overlap = len(c_tags & desired_tags)
+        score = overlap * 20 + fuzz.partial_ratio(background_note.lower(), c.lower()) / 10.0
+        scored.append((score, c, list(c_tags)))
+
+    scored.sort(reverse=True, key=lambda x: x[0])
+
+    top = []
+    seen = set()
+    for score, c, tags in scored:
+        if c.lower() not in seen:
+            seen.add(c.lower())
+            top.append(f"• {c} [{', '.join(tags)}]")
+        if len(top) >= 12:
+            break
+    return top
+
+# Хэндлеры команд
+@dp.message(Command("start"))
+async def start_cmd(message: Message):
+    txt = (
+        "👋 Привет! Я помогу сравнить магистратуры ИТМО:\n"
+        "— Искусственный интеллект (AI)\n"
+        "— AI Product (Управление ИИ-продуктами)\n\n"
+        "Команды:\n"
+        "• /sync — загрузить/обновить учебные планы (PDF → текст)\n"
+        "• /plan ai — показать дисциплины AI\n"
+        "• /plan aiproduct — показать дисциплины AI Product\n"
+        "• /reco <твой бэкграунд/интересы> — подберу элективы\n"
+        "• Используй /passport ai или /passport aiproduct, чтобы узнать паспорт программы\n"
+    )
+    await message.answer(txt)
+
+@dp.message(Command("sync"))
+async def sync_cmd(message: Message):
+    await message.answer("🔄 Скачиваю учебные планы и паршу PDF…")
+    try:
+        global PLANS
+        PLANS = await sync_all()
+        ai_n = len(PLANS.get("ai", {}).get("courses", []))
+        pr_n = len(PLANS.get("aiproduct", {}).get("courses", []))
+        await message.answer(
+            f"✅ Готово!\n"
+            f"📘 {PROGRAMS['ai']['title']}: {ai_n} дисциплин.\n"
+            f"📙 {PROGRAMS['aiproduct']['title']}: {pr_n} дисциплин."
+        )
+    except Exception as e:
+        await message.answer(f"⚠️ Ошибка синхронизации: {e}")
+
+@dp.message(Command("plan"))
+async def plan_cmd(message: Message):
+    args = message.text.split()
+    if len(args) < 2:
+        return await message.answer("Укажи программу: /plan ai или `/plan aiproduct`", parse_mode="Markdown")
+
+    key = args[1].lower().replace("_", "")
+    if key not in PROGRAMS:
+        return await message.answer("Не знаю такую программу. Используй: ai или aiproduct.")
+
+    if not ensure_data_loaded():
+        return await message.answer("Данные ещё не загружены. Нажми /sync.")
+
+    prog = PLANS.get(key, {})
+    courses = prog.get("courses", [])
+    if not courses:
+        return await message.answer("Не удалось найти дисциплины в плане. Попробуй /sync.")
+
+    title = PROGRAMS[key]["title"]
+    head = f"📚 Дисциплины — {title}\n(показано максимум 60 строк)\n\n"
+    BATCH = 60
+    chunks = [courses[i:i+BATCH] for i in range(0, min(len(courses), 300), BATCH)]
+    for i, block in enumerate(chunks, 1):
+        body = "\n".join(f"{n+1}. {c}" for n, c in enumerate(block, start=(i-1)*BATCH))
+        await message.answer(head + body if i == 1 else body)
+
+@dp.message(Command("reco"))
+async def reco_cmd(message: Message):
+    if not ensure_data_loaded():
+        return await message
+        answer("Сначала /sync — нужно скачать и распарсить учебные планы.")
+    text = message.text.partition(" ")[2].strip()
+    if not text:
+        return await message.answer(
+            "Напиши кратко про себя и интересы. Пример:\n"
+            "/reco Опыт: Python, SQL, аналитика; интересы: LLM, NLP, MLOps"
+        )
+
+    prog_key = find_program_key(text) or "ai"  # по умолчанию — тех. AI
+    items = recommend_electives(text, prog_key)
+    if not items:
+        return await message.answer("Пока не могу сформировать рекомендации. Попробуй /sync.")
+    title = PROGRAMS[prog_key]["title"]
+    await message.answer(f"🎯 Рекомендации по элективам для «{title}» (до 12):\n\n" + "\n".join(items))
+@dp.message(Command("passport"))
+async def passport_cmd(message: Message):
+    args = message.text.split()
+    if len(args) < 2:
+        return await message.answer("Укажи программу: /passport ai или `/passport aiproduct`", parse_mode="Markdown")
+
+    key = args[1].lower().replace("_", "")
+    if key not in PROGRAMS:
+        return await message.answer("Не знаю такую программу. Используй: ai или aiproduct.")
+
+    PASSPORTS = {
+        "ai": {
+            "title": "Искусственный интеллект (AI Talent Hub)",
+            "duration": "2 года",
+            "form": "очная магистратура в онлайн-формате",
+            "cost": "≈ 599 000 ₽/год",
+            "tracks": ["ML/NLP", "CV/Robotics", "Data Science"],
+            "landing": PROGRAMS["ai"]["landing"]
+        },
+        "aiproduct": {
+            "title": "AI Product (Управление ИИ-продуктами)",
+            "duration": "2 года",
+            "form": "очная магистратура в онлайн-формате",
+            "cost": "≈ 599 000 ₽/год",
+            "tracks": ["Product Management", "AI Strategy", "Data Analytics"],
+            "landing": PROGRAMS["aiproduct"]["landing"]
+        },
+    }
+
+    p = PASSPORTS[key]
+    txt = (
+        f" {p['title']}\n"
+        f" Длительность: {p['duration']}\n"
+        f" Форма обучения: {p['form']}\n"
+        f" Стоимость: {p['cost']}\n"
+        f" Треки/направления: {', '.join(p['tracks'])}\n"
+        f" Сайт: {p['landing']}"
+    )
+    await message.answer(txt)
+
+@dp.message()
+async def any_msg(message: Message):
+    q = message.text.strip()
+    if not ensure_data_loaded():
+        return await message.answer("Сначала /sync — я загружу учебные планы и смогу отвечать по содержанию.")
+    if not answer_is_relevant(q):
+        return await message.answer(
+            "Я отвечаю только по обучению на двух программах ИТМО: "
+            "«Искусственный интеллект» и «AI Product». Попробуй переформулировать 🙌"
+        )
+    ans = rag_answer(q, list(PROGRAMS.keys()))
+    await message.answer(ans)
+
+# Запуск
+async def main():
+    print("Бот запущен. Команда: /sync — чтобы загрузить планы.")
+    await dp.start_polling(bot)
+
+asyncio.run(main())
